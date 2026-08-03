@@ -6,11 +6,24 @@ edition = "2024"
 [dependencies]
 log = "0.4"
 regex = "1.12"
-slint = "1.14"
 anyhow = "1.0"
 env_logger = "0.11"
 urlencoding = "2.1"
-reqwest = { version = "0.13", features = ["blocking"] }
-
-[build-dependencies]
-slint-build = "1.14"
+egui_software_backend = { version = "0.0.3", default-features = false, features = ["std"] }
+bytemuck = "1"
+x11rb = { version = "0.13", default-features = false }
+egui = { version = "0.34", default-features = false, features = [
+  "default_fonts",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+  "logging",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "blocking",
+  "rustls-no-provider",
+] }
+xim = { version = "0.5", default-features = false, features = ["x11rb-client"] }
+xim-parser = "0.2"

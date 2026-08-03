@@ -1,0 +1,5 @@
+# musl 目标：nixpkgs 交叉工具链（参考 ../hns 的静态编译方案）
+# 需要 x86_64-unknown-linux-musl-gcc 在 PATH 中：
+#   nix-shell -p pkgsCross.musl64.stdenv.cc
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-unknown-linux-musl-gcc"
