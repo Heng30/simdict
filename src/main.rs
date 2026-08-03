@@ -1,37 +1,36 @@
 //! simdict —— Bing 词典查词小工具。
 //!
-//! UI 层完全基于纯 Rust 栈：egui（即时模式 GUI）+ egui_software_backend
-//! （CPU 软渲染）+ x11rb（X11 协议，不链接 libxcb、不 dlopen）。
-//! 整条链路零 C 依赖，可 musl 全静态编译。
+//! UI 层基于纯 Rust 栈：egui（即时模式 GUI）+ egui_software_backend
+//! （CPU 软渲染）+ x11rb（X11 协议，不链接 libxcb、不 dlopen），可 musl 全静态编译。
+//! 中文输入走 XIM（fcitx5）。
 
 mod translation;
-
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
-use log::{info, warn};
-
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    self, ConnectionExt as _, EventMask, Gcontext, ImageFormat, KeyPressEvent, PropMode, Window,
-    WindowClass,
+use egui::{
+    Key, Modifiers, PointerButton, Pos2, RawInput, RichText, Vec2, ViewportId, ViewportInfo,
 };
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
-
-use xim::x11rb::X11rbClient;
-use xim::{Client, ClientError, ClientHandler};
+use log::{info, warn};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
+use x11rb::{
+    connection::Connection,
+    protocol::xproto::{
+        self, ConnectionExt as _, EventMask, Gcontext, ImageFormat, KeyPressEvent, PropMode,
+        Window, WindowClass,
+    },
+    rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
+};
+use xim::{Client, ClientError, ClientHandler, x11rb::X11rbClient};
 use xim_parser::{AttributeName, ForwardEventFlag, InputStyle, Point};
-
-use egui::{Key, Modifiers, PointerButton, Pos2, RawInput, RichText, Vec2, ViewportId, ViewportInfo};
 
 const WIN_WIDTH: u16 = 600;
 const WIN_HEIGHT: u16 = 400;
 
-// 内嵌 CJK 字体（Source Han Sans CN，OFL 协议），保证中文释义与 IPA 音标可渲染
+// 内嵌字体：CJK（Source Han Sans CN）+ IPA 音标（DejaVu Sans）
 const CJK_FONT: &[u8] = include_bytes!("../SourceHanSansCN.otf");
-// 内嵌 IPA 字体（DejaVu Sans）：Source Han Sans CN 缺 əɔŋːˈ 等音标字形
 const IPA_FONT: &[u8] = include_bytes!("../DejaVuSans.ttf");
 
 /// 翻译结果字体大小（px）
@@ -41,7 +40,7 @@ const INPUT_FONT_SIZE: f32 = 28.0;
 /// 文本内边距（px）
 const TEXT_PADDING: f32 = 4.0;
 
-// ---- X11 keysym 常量（X 协议标准值）----
+// X11 keysym 常量
 const KS_RETURN: u32 = 0xFF0D;
 const KS_ESCAPE: u32 = 0xFF1B;
 const KS_BACKSPACE: u32 = 0xFF08;
@@ -58,32 +57,22 @@ const KS_PAGE_DOWN: u32 = 0xFF56;
 
 fn main() -> Result<()> {
     // reqwest 使用 rustls-no-provider，运行时必须安装 crypto provider
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
+    _ = rustls::crypto::ring::default_provider().install_default();
     env_logger::init();
 
-    let argv: Vec<String> = std::env::args().collect();
-    let initial_search = if argv.len() > 1 {
-        argv[1].clone().trim().to_string()
-    } else {
-        String::new()
-    };
+    let initial_search = std::env::args()
+        .nth(1)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
-    let (conn, screen_num) = match x11rb::connect(None) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("无法连接 X server（需要图形环境）：{e}");
-            std::process::exit(1);
-        }
-    };
+    let (conn, screen_num) = x11rb::connect(None).unwrap_or_else(|e| {
+        eprintln!("无法连接 X server（需要图形环境）：{e}");
+        std::process::exit(1);
+    });
     let screen = &conn.setup().roots[screen_num];
 
     let (tx, rx) = mpsc::channel::<Result<String>>();
-
-    let mut app = App::new(&conn, screen, tx, initial_search)?;
-    app.load_keymap(&conn)?;
-
-    // 启动参数带词时，首次进入就触发搜索
+    let mut app = App::new(&conn, screen, screen_num, tx, initial_search)?;
     if !app.input.is_empty() {
         app.do_search();
     }
@@ -92,113 +81,20 @@ fn main() -> Result<()> {
     let ctx = egui::Context::default();
     setup_fonts(&ctx);
     ctx.set_visuals(egui::Visuals::dark());
-
     let mut renderer = egui_software_backend::EguiSoftwareRender::new(
         egui_software_backend::ColorFieldOrder::Bgra,
     );
 
     info!("window {}x{} ready", app.width, app.height);
 
-    // XIM 输入法（fcitx5）：失败则降级为无 IME 模式
-    let mut ime = match X11rbClient::init(&conn, screen_num, None) {
-        Ok(c) => {
-            info!("XIM 客户端已初始化");
-            Some(c)
-        }
-        Err(e) => {
-            warn!("无 XIM 输入法（{e}），中文输入不可用");
-            None
-        }
-    };
-    let mut ime_state = Ime::new(app.window);
-
     while app.running {
-        let mut had_event = false;
-        while let Some(event) = conn.poll_for_event()? {
-            had_event = true;
-
-            // 1. XIM 协议事件优先（握手、commit、回传按键等）
-            if let Some(im) = ime.as_mut() {
-                if im.filter_event(&event, &mut ime_state)? {
-                    continue;
-                }
-            }
-
-            // 2. 取出 XIM 回调产物
-            for text in ime_state.commits.drain(..) {
-                info!("IME commit: {text}");
-                insert_commit(&ctx, &mut app.input, &text);
-                ctx.request_repaint();
-            }
-            for xev in ime_state.forwarded.drain(..) {
-                // fcitx 未消费的按键：作为正常输入处理
-                app.handle_key(xev.detail, u16::from(xev.state), xev.response_type == 2)?;
-            }
-
-            // 3. 按键事件：IME 就绪时转发给 fcitx，由它决定消费或回传
-            match &event {
-                x11rb::protocol::Event::KeyPress(e) | x11rb::protocol::Event::KeyRelease(e) => {
-                    if let (Some(im), true) = (ime.as_mut(), ime_state.ready) {
-                        im.forward_event(
-                            ime_state.im_id,
-                            ime_state.ic_id,
-                            ForwardEventFlag::empty(),
-                            e,
-                        )?;
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-
-            // 4. 普通事件处理（先提取焦点信息，因为 event 会被移动）
-            let focus_change = match &event {
-                x11rb::protocol::Event::FocusIn(_) => Some(true),
-                x11rb::protocol::Event::FocusOut(_) => Some(false),
-                _ => None,
-            };
-            app.handle_x_event(&conn, event)?;
-
-            // 5. 焦点变化同步给 IME
-            if let (Some(focused), true) = (focus_change, ime_state.ready) {
-                if let Some(im) = ime.as_mut() {
-                    if focused {
-                        im.set_focus(ime_state.im_id, ime_state.ic_id)?;
-                    } else {
-                        im.unset_focus(ime_state.im_id, ime_state.ic_id)?;
-                    }
-                }
-            }
-        }
-
-        if let Ok(res) = rx.try_recv() {
-            app.searching = false;
-            match res {
-                Ok(t) if t == translation::NOT_FOUND => {
-                    info!("未找到：无匹配结果");
-                    app.not_found = true;
-                    app.translation.clear();
-                }
-                Ok(t) => {
-                    app.not_found = false;
-                    app.translation = t;
-                }
-                Err(e) => {
-                    app.not_found = false;
-                    app.translation = format!("Error: {e}");
-                }
-            }
-            ctx.request_repaint();
-        }
-
+        let had_event = app.pump(&ctx, &rx)?;
         if had_event || app.first_frame || ctx.has_requested_repaint() {
-            app.run_frame(&conn, &ctx, &mut renderer, &start)?;
-            conn.flush()?;
+            app.run_frame(&ctx, &mut renderer, &start)?;
+            app.conn.flush()?;
         }
-
         std::thread::sleep(Duration::from_millis(2));
     }
-
     Ok(())
 }
 
@@ -212,14 +108,13 @@ fn setup_fonts(ctx: &egui::Context) {
         "deja_vu_sans".to_owned(),
         egui::FontData::from_static(IPA_FONT).into(),
     );
-    // 回退顺序：默认字体（拉丁）→ DejaVu（IPA 音标）→ Source Han Sans（CJK）
-    // egui 按顺序取第一个含该字形的字体
+    // 回退顺序：默认字体（拉丁）→ DejaVu（IPA）→ Source Han Sans（CJK）
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         let f = fonts.families.entry(family).or_default();
         f.push("deja_vu_sans".to_owned());
         f.push("source_han_sans_cn".to_owned());
     }
-    // 专用字体族：音标整体用 DejaVu Sans 渲染，避免拉丁字形来自默认字体造成混排
+    // 专用字体族：音标行整体用 DejaVu Sans，避免拉丁字形混排
     fonts.families.insert(
         egui::FontFamily::Name("ipa".into()),
         vec!["deja_vu_sans".to_owned()],
@@ -227,11 +122,19 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-struct App {
+/// 中央面板的视图状态。
+#[derive(PartialEq)]
+enum State {
+    Idle,
+    Searching,
+    NotFound,
+    Result(String),
+}
+
+struct App<'a> {
+    conn: &'a RustConnection,
     input: String,
-    translation: String,
-    searching: bool,
-    not_found: bool,
+    state: State,
     first_frame: bool,
     running: bool,
     tx: mpsc::Sender<Result<String>>,
@@ -250,188 +153,17 @@ struct App {
     first_keycode: u8,
     keysyms_per_keycode: u8,
     keymap: Vec<u32>,
+
+    // XIM 输入法（fcitx5）：None = 无输入法环境，降级为纯键盘输入
+    ime: Option<X11rbClient<&'a RustConnection>>,
+    ime_state: Ime,
 }
 
-/// XIM 输入法客户端状态（fcitx5）。
-///
-/// 回调产物（commit 文本 / 回传按键）暂存在队列里，由主循环每轮取出处理。
-struct Ime {
-    window: Window,
-    im_id: u16,
-    ic_id: u16,
-    ready: bool,
-    commits: Vec<String>,
-    forwarded: Vec<KeyPressEvent>,
-}
-
-impl Ime {
-    fn new(window: Window) -> Self {
-        Self {
-            window,
-            im_id: 0,
-            ic_id: 0,
-            ready: false,
-            commits: Vec::new(),
-            forwarded: Vec::new(),
-        }
-    }
-}
-
-impl ClientHandler<X11rbClient<&RustConnection>> for Ime {
-    fn handle_connect(&mut self, client: &mut X11rbClient<&RustConnection>) -> Result<(), ClientError> {
-        info!("XIM 已连接");
-        // 与 XMODIFIERS/桌面 locale 保持一致；fcitx 服务所有 locale
-        let locale = std::env::var("LANG").unwrap_or_else(|_| "zh_CN.UTF-8".into());
-        client.open(&locale)
-    }
-
-    fn handle_open(&mut self, client: &mut X11rbClient<&RustConnection>, input_method_id: u16) -> Result<(), ClientError> {
-        info!("XIM 输入法已打开，创建输入上下文");
-        self.im_id = input_method_id;
-        // Root 风格（PreeditNothing|StatusNothing）：fcitx 自己弹候选窗，
-        // 客户端只收 commit 字符串
-        let ic_attributes = client
-            .build_ic_attributes()
-            .push(
-                AttributeName::InputStyle,
-                InputStyle::PREEDIT_NOTHING | InputStyle::STATUS_NOTHING,
-            )
-            .push(AttributeName::ClientWindow, self.window)
-            .push(AttributeName::FocusWindow, self.window)
-            .nested_list(AttributeName::PreeditAttributes, |b| {
-                // 输入框位置（窗口内坐标），供 fcitx 定位候选窗
-                b.push(AttributeName::SpotLocation, Point { x: 8, y: 20 });
-            })
-            .build();
-        client.create_ic(input_method_id, ic_attributes)
-    }
-
-    fn handle_create_ic(
-        &mut self,
-        client: &mut X11rbClient<&RustConnection>,
-        input_method_id: u16,
-        input_context_id: u16,
-    ) -> Result<(), ClientError> {
-        info!("输入上下文已创建（{input_context_id}），中文输入可用");
-        self.ic_id = input_context_id;
-        self.ready = true;
-        client.set_focus(input_method_id, input_context_id)
-    }
-
-    fn handle_commit(
-        &mut self,
-        _client: &mut X11rbClient<&RustConnection>,
-        _input_method_id: u16,
-        _input_context_id: u16,
-        text: &str,
-    ) -> Result<(), ClientError> {
-        debug_commit(text);
-        self.commits.push(text.to_string());
-        Ok(())
-    }
-
-    /// fcitx 未消费的按键会回传：交给正常输入处理
-    fn handle_forward_event(
-        &mut self,
-        _client: &mut X11rbClient<&RustConnection>,
-        _input_method_id: u16,
-        _input_context_id: u16,
-        _flag: ForwardEventFlag,
-        xev: KeyPressEvent,
-    ) -> Result<(), ClientError> {
-        self.forwarded.push(xev);
-        Ok(())
-    }
-
-    fn handle_preedit_start(
-        &mut self,
-        _client: &mut X11rbClient<&RustConnection>,
-        _input_method_id: u16,
-        _input_context_id: u16,
-    ) -> Result<(), ClientError> {
-        Ok(())
-    }
-
-    fn handle_preedit_done(
-        &mut self,
-        _client: &mut X11rbClient<&RustConnection>,
-        _input_method_id: u16,
-        _input_context_id: u16,
-    ) -> Result<(), ClientError> {
-        Ok(())
-    }
-
-    fn handle_preedit_draw(
-        &mut self,
-        _client: &mut X11rbClient<&RustConnection>,
-        _input_method_id: u16,
-        _input_context_id: u16,
-        _caret: i32,
-        _chg_first: i32,
-        _chg_len: i32,
-        _status: xim::PreeditDrawStatus,
-        _preedit_string: &str,
-        _feedbacks: Vec<xim::Feedback>,
-    ) -> Result<(), ClientError> {
-        // Root 风格下候选/拼音由 fcitx 自己的弹窗展示，客户端无需渲染
-        Ok(())
-    }
-
-    fn handle_disconnect(&mut self) {
-        self.ready = false;
-        warn!("XIM 断开连接");
-    }
-
-    fn handle_close(&mut self, client: &mut X11rbClient<&RustConnection>, _input_method_id: u16) -> Result<(), ClientError> {
-        self.ready = false;
-        client.disconnect()
-    }
-
-    fn handle_destroy_ic(
-        &mut self,
-        client: &mut X11rbClient<&RustConnection>,
-        input_method_id: u16,
-        _input_context_id: u16,
-    ) -> Result<(), ClientError> {
-        client.close(input_method_id)
-    }
-}
-
-fn debug_commit(text: &str) {
-    info!("IME commit: {text}");
-}
-
-/// 把 IME 提交的文本插入到输入框光标处，并把光标移到插入文本之后。
-fn insert_commit(ctx: &egui::Context, input: &mut String, text: &str) {
-    let edit_id = egui::Id::new("search_input");
-
-    // 当前光标位置（字符索引）；无状态时默认追加到末尾
-    let char_idx = egui::TextEdit::load_state(ctx, edit_id)
-        .and_then(|s| s.cursor.char_range().map(|r| r.primary.index))
-        .unwrap_or_else(|| input.chars().count());
-
-    // 字符索引 → 字节偏移
-    let byte_idx = input
-        .char_indices()
-        .nth(char_idx)
-        .map(|(i, _)| i)
-        .unwrap_or(input.len());
-    input.insert_str(byte_idx, text);
-
-    // 光标移到插入文本之后（egui 状态里是字符索引）
-    let new_pos = char_idx + text.chars().count();
-    if let Some(mut state) = egui::TextEdit::load_state(ctx, edit_id) {
-        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-            egui::text::CCursor::new(new_pos),
-        )));
-        state.store(ctx, edit_id);
-    }
-}
-
-impl App {
+impl<'a> App<'a> {
     fn new(
-        conn: &impl Connection,
+        conn: &'a RustConnection,
         screen: &xproto::Screen,
+        screen_num: usize,
         tx: mpsc::Sender<Result<String>>,
         initial_search: String,
     ) -> Result<Self> {
@@ -463,10 +195,7 @@ impl App {
         conn.create_gc(gc, window, &xproto::CreateGCAux::new())?;
 
         let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS")?.reply()?.atom;
-        let wm_delete_window = conn
-            .intern_atom(false, b"WM_DELETE_WINDOW")?
-            .reply()?
-            .atom;
+        let wm_delete_window = conn.intern_atom(false, b"WM_DELETE_WINDOW")?.reply()?.atom;
         let net_wm_name = conn.intern_atom(false, b"_NET_WM_NAME")?.reply()?.atom;
         let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
         let wm_name = conn.intern_atom(false, b"WM_NAME")?.reply()?.atom;
@@ -474,16 +203,25 @@ impl App {
         let atom_atom = conn.intern_atom(false, b"ATOM")?.reply()?.atom;
 
         // 悬浮窗口：UTILITY 类型（平铺 WM 不拉伸）+ 置顶 + 跳过任务栏 + 无装饰
-        let net_wm_window_type = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE")?.reply()?.atom;
-        let net_wm_window_type_utility =
-            conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_UTILITY")?.reply()?.atom;
+        let net_wm_window_type = conn
+            .intern_atom(false, b"_NET_WM_WINDOW_TYPE")?
+            .reply()?
+            .atom;
+        let net_wm_window_type_utility = conn
+            .intern_atom(false, b"_NET_WM_WINDOW_TYPE_UTILITY")?
+            .reply()?
+            .atom;
         let net_wm_state = conn.intern_atom(false, b"_NET_WM_STATE")?.reply()?.atom;
-        let net_wm_state_above = conn.intern_atom(false, b"_NET_WM_STATE_ABOVE")?.reply()?.atom;
-        let net_wm_state_skip_taskbar =
-            conn.intern_atom(false, b"_NET_WM_STATE_SKIP_TASKBAR")?.reply()?.atom;
+        let net_wm_state_above = conn
+            .intern_atom(false, b"_NET_WM_STATE_ABOVE")?
+            .reply()?
+            .atom;
+        let net_wm_state_skip_taskbar = conn
+            .intern_atom(false, b"_NET_WM_STATE_SKIP_TASKBAR")?
+            .reply()?
+            .atom;
         let motif_wm_hints = conn.intern_atom(false, b"_MOTIF_WM_HINTS")?.reply()?.atom;
-        let motif_wm_hints_type =
-            conn.intern_atom(false, b"MOTIF_WM_HINTS")?.reply()?.atom;
+        let motif_wm_hints_type = conn.intern_atom(false, b"MOTIF_WM_HINTS")?.reply()?.atom;
 
         conn.change_property32(
             PropMode::REPLACE,
@@ -509,26 +247,18 @@ impl App {
         )?;
 
         // EWMH：_NET_WM_STATE 必须用 ClientMessage 请求 WM 修改（直接写属性会被覆盖）
-        let net_wm_state_message = xproto::ClientMessageEvent {
-            response_type: 33, // ClientMessage
-            format: 32,
-            sequence: 0,
-            window,
-            type_: net_wm_state,
-            data: [
-                net_wm_state_above,
-                net_wm_state_skip_taskbar,
-                0,
-                0,
-                0,
-            ]
-            .into(),
-        };
         conn.send_event(
             false,
             screen.root,
             EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-            net_wm_state_message,
+            xproto::ClientMessageEvent {
+                response_type: 33, // ClientMessage
+                format: 32,
+                sequence: 0,
+                window,
+                type_: net_wm_state,
+                data: [net_wm_state_above, net_wm_state_skip_taskbar, 0, 0, 0].into(),
+            },
         )?;
 
         // 窗口标题 + 关闭协议
@@ -551,11 +281,10 @@ impl App {
         conn.map_window(window)?;
         conn.flush()?;
 
-        Ok(Self {
+        let mut app = Self {
+            conn,
             input: initial_search,
-            translation: String::new(),
-            searching: false,
-            not_found: false,
+            state: State::Idle,
             first_frame: true,
             running: true,
             tx,
@@ -571,46 +300,127 @@ impl App {
             first_keycode: conn.setup().min_keycode,
             keysyms_per_keycode: 0,
             keymap: Vec::new(),
-        })
+            ime: None,
+            ime_state: Ime::new(window),
+        };
+        app.load_keymap()?;
+        app.ime = match X11rbClient::init(conn, screen_num, None) {
+            Ok(ime) => {
+                info!("XIM 客户端已初始化");
+                Some(ime)
+            }
+            Err(e) => {
+                warn!("无 XIM 输入法（{e}），中文输入不可用");
+                None
+            }
+        };
+        Ok(app)
     }
 
-    fn load_keymap(&mut self, conn: &impl Connection) -> Result<()> {
-        let min = conn.setup().min_keycode;
-        let count = conn.setup().max_keycode - min + 1;
-        let reply = conn.get_keyboard_mapping(min, count)?.reply()?;
+    fn load_keymap(&mut self) -> Result<()> {
+        let min = self.conn.setup().min_keycode;
+        let count = self.conn.setup().max_keycode - min + 1;
+        let reply = self.conn.get_keyboard_mapping(min, count)?.reply()?;
         self.keysyms_per_keycode = reply.keysyms_per_keycode;
         self.keymap = reply.keysyms;
         Ok(())
     }
 
-    fn keysyms_of(&self, keycode: u8) -> &[u32] {
-        let kpc = self.keysyms_per_keycode as usize;
-        if kpc == 0 {
-            return &[];
+    /// 处理一轮 X 事件与异步结果，返回是否有事件发生。
+    fn pump(&mut self, ctx: &egui::Context, rx: &mpsc::Receiver<Result<String>>) -> Result<bool> {
+        let mut had_event = false;
+        while let Some(event) = self.conn.poll_for_event()? {
+            had_event = true;
+            self.on_x_event(ctx, event)?;
         }
-        let idx = (keycode as usize - self.first_keycode as usize).saturating_mul(kpc);
-        self.keymap
-            .get(idx..idx + kpc)
-            .unwrap_or_default()
+        if let Ok(res) = rx.try_recv() {
+            self.state = match res {
+                Ok(t) if t == translation::NOT_FOUND => {
+                    info!("未找到：无匹配结果");
+                    State::NotFound
+                }
+                Ok(t) => State::Result(t),
+                Err(e) => State::Result(format!("Error: {e}")),
+            };
+            ctx.request_repaint();
+        }
+        Ok(had_event)
     }
 
-    fn handle_x_event(
-        &mut self,
-        conn: &impl Connection,
-        event: x11rb::protocol::Event,
-    ) -> Result<()> {
+    /// 单个 X 事件：XIM 优先，其次 IME 产物、按键转发、普通处理、焦点同步。
+    fn on_x_event(&mut self, ctx: &egui::Context, event: x11rb::protocol::Event) -> Result<()> {
+        // 1. XIM 协议事件优先（握手、commit、回传按键等）
+        if let Some(im) = self.ime.as_mut() {
+            if im.filter_event(&event, &mut self.ime_state)? {
+                return Ok(());
+            }
+        }
+
+        // 2. XIM 回调产物：commit 注入 egui 事件流（光标/撤销交给 TextEdit）；
+        //    回传按键作为正常输入
+        for text in std::mem::take(&mut self.ime_state.commits) {
+            info!("IME commit: {text}");
+            self.events.push(egui::Event::Text(text));
+            ctx.request_repaint();
+        }
+        for xev in std::mem::take(&mut self.ime_state.forwarded) {
+            self.handle_key(xev.detail, u16::from(xev.state), xev.response_type == 2)?;
+        }
+
+        // 3. 按键事件：IME 就绪时转发给 fcitx，由它决定消费或回传
+        if let x11rb::protocol::Event::KeyPress(e) | x11rb::protocol::Event::KeyRelease(e) = &event
+        {
+            if let (Some(im), true) = (self.ime.as_mut(), self.ime_state.ready) {
+                im.forward_event(
+                    self.ime_state.im_id,
+                    self.ime_state.ic_id,
+                    ForwardEventFlag::empty(),
+                    e,
+                )?;
+                return Ok(());
+            }
+        }
+
+        // 4. 普通事件处理（先提取焦点信息，因为 event 会被移动）
+        let focus_change = match &event {
+            x11rb::protocol::Event::FocusIn(_) => Some(true),
+            x11rb::protocol::Event::FocusOut(_) => Some(false),
+            _ => None,
+        };
+        self.handle_x_event(event)?;
+
+        // 5. 焦点变化同步给 IME
+        if let (Some(focused), true) = (focus_change, self.ime_state.ready) {
+            let im = self.ime.as_mut().expect("ime ready 时必存在");
+            if focused {
+                im.set_focus(self.ime_state.im_id, self.ime_state.ic_id)?;
+            } else {
+                im.unset_focus(self.ime_state.im_id, self.ime_state.ic_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_x_event(&mut self, event: x11rb::protocol::Event) -> Result<()> {
         use x11rb::protocol::Event as X;
         match event {
             X::KeyPress(e) => self.handle_key(e.detail, u16::from(e.state), true)?,
             X::KeyRelease(e) => self.handle_key(e.detail, u16::from(e.state), false)?,
-            X::ButtonPress(e) => self.handle_button(u16::from(e.state), e.event_x, e.event_y, e.detail, true),
-            X::ButtonRelease(e) => self.handle_button(u16::from(e.state), e.event_x, e.event_y, e.detail, false),
+            X::ButtonPress(e) => {
+                self.handle_button(u16::from(e.state), e.event_x, e.event_y, e.detail, true)
+            }
+            X::ButtonRelease(e) => {
+                self.handle_button(u16::from(e.state), e.event_x, e.event_y, e.detail, false)
+            }
             X::MotionNotify(e) => {
-                self.events
-                    .push(egui::Event::PointerMoved(Pos2::new(e.event_x as f32, e.event_y as f32)));
+                self.events.push(egui::Event::PointerMoved(Pos2::new(
+                    e.event_x as f32,
+                    e.event_y as f32,
+                )));
             }
             X::ConfigureNotify(e) => {
-                if e.width > 0 && e.height > 0 && (e.width != self.width || e.height != self.height) {
+                if e.width > 0 && e.height > 0 && (e.width != self.width || e.height != self.height)
+                {
                     self.width = e.width;
                     self.height = e.height;
                     self.pixels = vec![[0u8; 4]; e.width as usize * e.height as usize];
@@ -623,7 +433,7 @@ impl App {
             }
             _ => {}
         }
-        conn.flush()?;
+        self.conn.flush()?;
         Ok(())
     }
 
@@ -633,7 +443,11 @@ impl App {
             return Ok(());
         }
         let shift = state & 1 != 0;
-        let level = if shift && syms.len() > 1 && syms[1] != 0 { 1 } else { 0 };
+        let level = if shift && syms.len() > 1 && syms[1] != 0 {
+            1
+        } else {
+            0
+        };
         let sym = syms[level.min(syms.len() - 1)];
         let modifiers = modifiers_from_state(state);
 
@@ -667,7 +481,6 @@ impl App {
         let modifiers = modifiers_from_state(state);
         match detail {
             4 | 5 => {
-                // 滚轮
                 let y = if detail == 4 { 50.0 } else { -50.0 };
                 self.events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Point,
@@ -693,26 +506,31 @@ impl App {
         }
     }
 
+    fn keysyms_of(&self, keycode: u8) -> &[u32] {
+        let kpc = self.keysyms_per_keycode as usize;
+        if kpc == 0 {
+            return &[];
+        }
+        let idx = (keycode as usize - self.first_keycode as usize).saturating_mul(kpc);
+        self.keymap.get(idx..idx + kpc).unwrap_or_default()
+    }
+
     fn do_search(&mut self) {
         let word = self.input.trim().to_string();
-        if word.is_empty() || self.searching {
+        if word.is_empty() || self.state == State::Searching {
             return;
         }
         info!("Search requested for: {}", word);
-        self.searching = true;
-        self.not_found = false;
-        self.translation.clear();
+        self.state = State::Searching;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let res = translation::translate(&word);
-            let _ = tx.send(res);
+            let _ = tx.send(translation::translate(&word));
         });
     }
 
     #[allow(deprecated)] // egui 0.34 的 Panel::show 弃用但仍是根级面板的正确用法
     fn run_frame(
         &mut self,
-        conn: &impl Connection,
         ctx: &egui::Context,
         renderer: &mut egui_software_backend::EguiSoftwareRender,
         start: &Instant,
@@ -764,8 +582,7 @@ impl App {
                             .margin(TEXT_PADDING)
                             .desired_width(f32::INFINITY),
                     );
-                    // 占位符：egui 的 hint_text 被硬编码为左上对齐（多行场景需要），
-                    // 这里用 painter 自绘，做到与输入框垂直居中；字号为输入字体的 0.8 倍
+                    // 占位符：egui 的 hint_text 被硬编码为左上对齐，用 painter 自绘并垂直居中
                     if self.input.is_empty() {
                         ui.painter().text(
                             resp.rect.left_center() + egui::vec2(TEXT_PADDING, 0.0),
@@ -795,78 +612,11 @@ impl App {
                     .fill(egui::Color32::from_rgb(24, 26, 30))
                     .inner_margin(12.0),
             )
-            .show(ctx, |ui| {
-                if self.searching {
-                    draw_searching(ui);
-                } else if self.not_found {
-                    draw_not_found(ui);
-                } else if self.translation.is_empty() {
-                    draw_empty_state(ui);
-                } else {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let text_color = egui::Color32::from_rgb(225, 230, 235);
-                            let dot_color = egui::Color32::from_rgb(170, 180, 190);
-                            // 行距在默认基础上增加 8px
-                            ui.spacing_mut().item_spacing.y += 8.0;
-                            // 每行左侧的圆点：自绘，直径为字体大小的 1/3
-                            let dot_diameter = TRANSLATION_FONT_SIZE / 3.0;
-                            for line in self.translation.lines() {
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                ui.horizontal(|ui| {
-                                    if let Some(rest) = line.strip_prefix("· ") {
-                                        // 先占位（锁定 x 位置），label 加入后再绘制圆点，
-                                        // y 对齐到文字行中心 —— 水平布局按初始行高居中会偏上
-                                        let (dot_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(dot_diameter, dot_diameter),
-                                            egui::Sense::hover(),
-                                        );
-                                        // 音标行（API 格式 · [..]）整体用 DejaVu Sans
-                                        let font_id = if rest.starts_with('[') {
-                                            egui::FontId::new(
-                                                TRANSLATION_FONT_SIZE,
-                                                egui::FontFamily::Name("ipa".into()),
-                                            )
-                                        } else {
-                                            egui::FontId::new(
-                                                TRANSLATION_FONT_SIZE,
-                                                egui::FontFamily::Proportional,
-                                            )
-                                        };
-                                        let label_resp = ui.add(
-                                            egui::Label::new(
-                                                RichText::new(rest)
-                                                    .font(font_id)
-                                                    .color(text_color),
-                                            )
-                                            .wrap(),
-                                        );
-                                        let center = egui::pos2(
-                                            dot_rect.center().x,
-                                            label_resp.rect.center().y,
-                                        );
-                                        ui.painter().circle_filled(
-                                            center,
-                                            dot_diameter / 2.0,
-                                            dot_color,
-                                        );
-                                    } else {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(line)
-                                                    .size(TRANSLATION_FONT_SIZE)
-                                                    .color(text_color),
-                                            )
-                                            .wrap(),
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                }
+            .show(ctx, |ui| match &self.state {
+                State::Searching => draw_searching(ui),
+                State::NotFound => draw_not_found(ui),
+                State::Idle => draw_empty_state(ui),
+                State::Result(t) => draw_result(ui, t),
             });
 
         let full = ctx.end_pass();
@@ -883,7 +633,7 @@ impl App {
         }
 
         let bytes: &[u8] = bytemuck::cast_slice(&self.pixels);
-        conn.put_image(
+        self.conn.put_image(
             ImageFormat::Z_PIXMAP,
             self.window,
             self.gc,
@@ -896,6 +646,123 @@ impl App {
             bytes,
         )?;
         Ok(())
+    }
+}
+
+/// XIM 输入法客户端状态（fcitx5）。
+/// 回调产物（commit 文本 / 回传按键）暂存在队列里，由事件循环取出处理。
+struct Ime {
+    window: Window,
+    im_id: u16,
+    ic_id: u16,
+    ready: bool,
+    commits: Vec<String>,
+    forwarded: Vec<KeyPressEvent>,
+}
+
+impl Ime {
+    fn new(window: Window) -> Self {
+        Self {
+            window,
+            im_id: 0,
+            ic_id: 0,
+            ready: false,
+            commits: Vec::new(),
+            forwarded: Vec::new(),
+        }
+    }
+}
+
+impl ClientHandler<X11rbClient<&RustConnection>> for Ime {
+    fn handle_connect(
+        &mut self,
+        client: &mut X11rbClient<&RustConnection>,
+    ) -> Result<(), ClientError> {
+        info!("XIM 已连接");
+        let locale = std::env::var("LANG").unwrap_or_else(|_| "zh_CN.UTF-8".into());
+        client.open(&locale)
+    }
+
+    fn handle_open(
+        &mut self,
+        client: &mut X11rbClient<&RustConnection>,
+        input_method_id: u16,
+    ) -> Result<(), ClientError> {
+        info!("XIM 输入法已打开，创建输入上下文");
+        self.im_id = input_method_id;
+        // Root 风格（PreeditNothing|StatusNothing）：fcitx 自己弹候选窗，客户端只收 commit
+        let ic_attributes = client
+            .build_ic_attributes()
+            .push(
+                AttributeName::InputStyle,
+                InputStyle::PREEDIT_NOTHING | InputStyle::STATUS_NOTHING,
+            )
+            .push(AttributeName::ClientWindow, self.window)
+            .push(AttributeName::FocusWindow, self.window)
+            .nested_list(AttributeName::PreeditAttributes, |b| {
+                b.push(AttributeName::SpotLocation, Point { x: 8, y: 20 });
+            })
+            .build();
+        client.create_ic(input_method_id, ic_attributes)
+    }
+
+    fn handle_create_ic(
+        &mut self,
+        client: &mut X11rbClient<&RustConnection>,
+        input_method_id: u16,
+        input_context_id: u16,
+    ) -> Result<(), ClientError> {
+        info!("输入上下文已创建（{input_context_id}），中文输入可用");
+        self.ic_id = input_context_id;
+        self.ready = true;
+        client.set_focus(input_method_id, input_context_id)
+    }
+
+    fn handle_commit(
+        &mut self,
+        _client: &mut X11rbClient<&RustConnection>,
+        _input_method_id: u16,
+        _input_context_id: u16,
+        text: &str,
+    ) -> Result<(), ClientError> {
+        self.commits.push(text.to_string());
+        Ok(())
+    }
+
+    /// fcitx 未消费的按键会回传：交给正常输入处理
+    fn handle_forward_event(
+        &mut self,
+        _client: &mut X11rbClient<&RustConnection>,
+        _input_method_id: u16,
+        _input_context_id: u16,
+        _flag: ForwardEventFlag,
+        xev: KeyPressEvent,
+    ) -> Result<(), ClientError> {
+        self.forwarded.push(xev);
+        Ok(())
+    }
+
+    fn handle_disconnect(&mut self) {
+        self.ready = false;
+        warn!("XIM 断开连接");
+    }
+
+    fn handle_close(
+        &mut self,
+        client: &mut X11rbClient<&RustConnection>,
+        _input_method_id: u16,
+    ) -> Result<(), ClientError> {
+        self.ready = false;
+        client.disconnect()
+    }
+
+    fn handle_destroy_ic(
+        &mut self,
+        client: &mut X11rbClient<&RustConnection>,
+        input_method_id: u16,
+        _input_context_id: u16,
+    ) -> Result<(), ClientError> {
+        client.close(input_method_id)
     }
 }
 
@@ -956,7 +823,6 @@ fn draw_searching(ui: &mut egui::Ui) {
         egui::vec2(avail.width() * 0.5, avail.height() * 0.5),
     );
 
-    // 背景块 + 边框
     ui.painter()
         .rect_filled(half, 12.0, egui::Color32::from_rgb(34, 37, 43));
     ui.painter().rect_stroke(
@@ -966,7 +832,6 @@ fn draw_searching(ui: &mut egui::Ui) {
         egui::StrokeKind::Inside,
     );
 
-    // spinner + 文字，垂直水平都居中
     ui.scope_builder(egui::UiBuilder::new().max_rect(half), |ui| {
         ui.vertical_centered(|ui| {
             let content_h = 44.0 + 12.0 + 28.0;
@@ -984,11 +849,8 @@ fn draw_searching(ui: &mut egui::Ui) {
 
 /// 空状态：居中的放大镜图形（表示"还没有任何内容"）。
 fn draw_empty_state(ui: &mut egui::Ui) {
-    let avail = ui.available_rect_before_wrap();
-    let center = avail.center();
+    let center = ui.available_rect_before_wrap().center();
     draw_magnifier(ui, center, egui::Color32::from_gray(85));
-
-    // 提示文字
     ui.painter().text(
         center + egui::vec2(0.0, 95.0),
         egui::Align2::CENTER_CENTER,
@@ -1000,28 +862,30 @@ fn draw_empty_state(ui: &mut egui::Ui) {
 
 /// 未找到状态：放大镜 + X 标记，样式与启动空状态一致。
 fn draw_not_found(ui: &mut egui::Ui) {
-    let avail = ui.available_rect_before_wrap();
-    let center = avail.center();
-    let gray = egui::Color32::from_gray(85);
+    let center = ui.available_rect_before_wrap().center();
     let lens = center - egui::vec2(0.0, 8.0);
     let radius = 46.0;
 
-    draw_magnifier(ui, center, gray);
+    draw_magnifier(ui, center, egui::Color32::from_gray(85));
 
     // 镜片内的 X 标记（淡红）
-    let x_color = egui::Color32::from_rgb(205, 100, 100);
-    let x_stroke = egui::Stroke::new(5.0_f32, x_color);
+    let x_stroke = egui::Stroke::new(5.0_f32, egui::Color32::from_rgb(205, 100, 100));
     let half = radius * 0.38;
     ui.painter().line_segment(
-        [lens + egui::vec2(-half, -half), lens + egui::vec2(half, half)],
+        [
+            lens + egui::vec2(-half, -half),
+            lens + egui::vec2(half, half),
+        ],
         x_stroke,
     );
     ui.painter().line_segment(
-        [lens + egui::vec2(-half, half), lens + egui::vec2(half, -half)],
+        [
+            lens + egui::vec2(-half, half),
+            lens + egui::vec2(half, -half),
+        ],
         x_stroke,
     );
 
-    // 提示文字
     ui.painter().text(
         center + egui::vec2(0.0, 95.0),
         egui::Align2::CENTER_CENTER,
@@ -1029,6 +893,59 @@ fn draw_not_found(ui: &mut egui::Ui) {
         egui::FontId::new(18.0, egui::FontFamily::Proportional),
         egui::Color32::from_gray(150),
     );
+}
+
+/// 结果状态：逐行渲染（圆点 + 文字），行距 +8px。
+fn draw_result(ui: &mut egui::Ui, text: &str) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y += 8.0;
+            let text_color = egui::Color32::from_rgb(225, 230, 235);
+            let dot_color = egui::Color32::from_rgb(170, 180, 190);
+            // 每行左侧的圆点：自绘，直径为字体大小的 1/3
+            let dot_diameter = TRANSLATION_FONT_SIZE / 3.0;
+            for line in text.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    if let Some(rest) = line.strip_prefix("· ") {
+                        // 先占位（锁定 x 位置），label 加入后再绘制圆点，
+                        // y 对齐到文字行中心 —— 水平布局按初始行高居中会偏上
+                        let (dot_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(dot_diameter, dot_diameter),
+                            egui::Sense::hover(),
+                        );
+                        // 音标行（API 格式 · [..]）整体用 DejaVu Sans
+                        let font_id = if rest.starts_with('[') {
+                            egui::FontId::new(
+                                TRANSLATION_FONT_SIZE,
+                                egui::FontFamily::Name("ipa".into()),
+                            )
+                        } else {
+                            egui::FontId::new(TRANSLATION_FONT_SIZE, egui::FontFamily::Proportional)
+                        };
+                        let label_resp = ui.add(
+                            egui::Label::new(RichText::new(rest).font(font_id).color(text_color))
+                                .wrap(),
+                        );
+                        let center = egui::pos2(dot_rect.center().x, label_resp.rect.center().y);
+                        ui.painter()
+                            .circle_filled(center, dot_diameter / 2.0, dot_color);
+                    } else {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(line)
+                                    .size(TRANSLATION_FONT_SIZE)
+                                    .color(text_color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
+            }
+        });
 }
 
 /// 放大镜图形：镜片圆环 + 手柄。

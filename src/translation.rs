@@ -5,6 +5,36 @@
 
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::sync::OnceLock;
+
+const API_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36";
+const FALLBACK_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36 Edg/90.0.818.62";
+
+/// 共享的 blocking client：连接池跨查询复用，避免每次搜索重建连接 + TLS 握手。
+fn client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(API_UA)
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
+/// GET 并校验状态码，返回响应文本。UA 可按请求覆盖（fallback 用 Edge UA）。
+fn get(url: &str, ua: &str) -> Result<String> {
+    let response = client()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, ua)
+        .send()?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "API returned status: {}",
+            response.status()
+        ));
+    }
+    Ok(response.text()?)
+}
 
 /// 未找到时的返回标记
 pub const NOT_FOUND: &str = "No Data";
@@ -45,21 +75,7 @@ fn fetch_from_bing(word: &str) -> Result<String> {
         "https://cn.bing.com/dict/SerpHoverTrans?q={}",
         urlencoding::encode(word)
     );
-
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.100 Safari/537.36")
-        .build()?;
-
-    let response = client.get(&url).send()?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "API returned status: {}",
-            response.status()
-        ));
-    }
-
-    let html = response.text()?;
+    let html = get(&url, API_UA)?;
     let result = parse_bing_response(&html).ok_or(anyhow::anyhow!("parse_bing_response failed"))?;
 
     if result.is_empty() {
@@ -74,21 +90,7 @@ fn fetch_from_bing_fallback(word: &str) -> Result<String> {
         "https://cn.bing.com/dict/search?q={}",
         urlencoding::encode(word)
     );
-
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36 Edg/90.0.818.62")
-        .build()?;
-
-    let response = client.get(&url).send()?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "API returned status: {}",
-            response.status()
-        ));
-    }
-
-    let html = response.text()?;
+    let html = get(&url, FALLBACK_UA)?;
     let result = parse_bing_response_fallback(&html)
         .ok_or(anyhow::anyhow!("parse_bing_response_fallback failed"))?;
 
@@ -166,9 +168,10 @@ fn parse_bing_response_fallback(html: &str) -> Option<String> {
 
     // 必须含音标（美[..] 英[..]）或词性标记，否则是样板文案 → 无结果
     let has_phonetic = desc.contains("美[") || desc.contains("英[");
-    let pos_re =
-        regex::Regex::new(r"(^|[，;\s])(n|v|adj|adv|prep|conj|int|pron|num|art|vt|vi|aux|abbr|det|modal)\.\s")
-            .ok()?;
+    let pos_re = regex::Regex::new(
+        r"(^|[，;\s])(n|v|adj|adv|prep|conj|int|pron|num|art|vt|vi|aux|abbr|det|modal)\.\s",
+    )
+    .ok()?;
     let has_pos = pos_re.is_match(&desc);
     if !has_phonetic && !has_pos {
         return None;
@@ -267,12 +270,16 @@ mod tests {
     fn parses_phonetic_and_explanations_from_api() {
         let out = parse_bing_response(API_FIXTURE).expect("should parse api fixture");
         assert!(out.contains("[heˈləʊ]"), "phonetic missing: {out}");
-        assert!(out.contains("· int. 你好；喂；您好；哈喽"), "explanation missing: {out}");
+        assert!(
+            out.contains("· int. 你好；喂；您好；哈喽"),
+            "explanation missing: {out}"
+        );
     }
 
     #[test]
     fn parses_description_from_search_page() {
-        let out = parse_bing_response_fallback(SEARCH_FIXTURE).expect("should parse search fixture");
+        let out =
+            parse_bing_response_fallback(SEARCH_FIXTURE).expect("should parse search fixture");
         assert!(out.contains("hello"), "word missing: {out}");
         assert!(out.contains("美[heˈləʊ]"), "US phonetic missing: {out}");
         assert!(out.contains("int. 你好"), "explanation missing: {out}");
